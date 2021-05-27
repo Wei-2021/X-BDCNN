@@ -1,0 +1,335 @@
+import os
+import os.path
+import random
+import glob
+import numpy as np
+import cv2
+import h5py
+import torch
+import torch.utils.data as udata
+import utils
+from skimage.measure.simple_metrics import peak_signal_noise_ratio
+import torch.nn as nn
+import torch.nn.functional as F
+
+
+######################data loader################## 
+class Dataset(udata.Dataset):
+    r"""
+    Implements torch.utils.data.Dataset
+    shape NxCxHxW
+    """
+    def __init__(self, inputdir,train=True, shuffle=False):
+        super(Dataset, self).__init__()
+        self.train = train
+        self.input = inputdir # './datasets/train_gray.h5'
+
+        if self.train:
+            self.traindbf = self.input + 'train_gray.h5'
+            h5f = h5py.File(self.traindbf, 'r')
+        else:
+            self.valdbf = self.input + 'val_gray.h5'
+            h5f = h5py.File(self.valdbf, 'r') 
+        self.keys = list(h5f.keys())
+        if shuffle:
+            random.shuffle(self.keys)
+        h5f.close()
+
+    def __len__(self):
+        return len(self.keys)
+
+    def __getitem__(self, index):
+        if self.train:
+            h5f = h5py.File(self.traindbf, 'r')
+        else:
+            h5f = h5py.File(self.valdbf, 'r')
+ 
+        key = self.keys[index]
+        data = np.array(h5f[key])
+        h5f.close()
+        return torch.Tensor(data)
+
+################## add hybrid noise################
+def AddHybridNoise(image,sigma=None):
+    """input:image: CxHxW
+    return: CxHxW
+    """
+    
+    assert len(image.shape) == 3, "input image shape"
+    c,h,w = image.shape
+    if np.max(image)<=1:
+        image = image*255.0
+    sigma_s = np.random.randint(0,20) #the standard variance of gaussian
+    eta = np.random.randint(4,19)/10 # the intensity of poisson
+
+    guassian_noise = np.random.normal(scale=sigma_s,size=(h,w))
+    img_poisson = np.random.poisson(image[0]*eta)/eta
+    mixed_noise_img = img_poisson + guassian_noise
+    mixed_noise_img = np.clip(mixed_noise_img,0,255)/255.
+    
+    gaussian_level = sigma_s*np.ones_like(image[0])/255.
+    poisson_level = eta/np.ones_like(image[0])
+    noise_level = np.stack((poisson_level,gaussian_level),axis=0)
+
+    mixed_noise_img = torch.from_numpy(np.expand_dims(mixed_noise_img,0))
+    noise_level = torch.from_numpy(np.expand_dims(noise_level,0))
+
+    return mixed_noise_img, noise_level
+
+
+################## metrix##########################
+def batch_psnr(img, imclean, data_range):
+    r"""
+    Computes the PSNR along the batch dimension (not pixel-wise)
+
+    Args:
+        img: a `torch.Tensor` containing the restored image
+        imclean: a `torch.Tensor` containing the reference image
+        data_range: The data range of the input image (distance between
+            minimum and maximum possible values). By default, this is estimated
+            from the image data-type.
+    """
+    img_cpu = img.data.cpu().numpy().astype(np.float32)
+    imgclean = imclean.data.cpu().numpy().astype(np.float32)
+    psnr = 0
+    for i in range(img_cpu.shape[0]):
+        psnr += peak_signal_noise_ratio(imgclean[i, :, :, :], img_cpu[i, :, :, :], \
+                       data_range=data_range)
+    return psnr/img_cpu.shape[0]
+
+
+def hwc_to_chw(img):
+    return np.transpose(img, axes=[2, 0, 1])
+
+
+def chw_to_hwc(img):
+    return np.transpose(img, axes=[1, 2, 0])
+
+##################################loss##################################
+def _fspecial_gauss_1d(size, sigma):
+    r"""Create 1-D gauss kernel
+    Args:
+        size (int): the size of gauss kernel
+        sigma (float): sigma of normal distribution
+
+    Returns:
+        torch.Tensor: 1D kernel
+    """
+    coords = torch.arange(size).to(dtype=torch.float)
+    coords -= size//2
+
+    g = torch.exp(-(coords**2) / (2*sigma**2))
+    g /= g.sum()
+
+    return g.unsqueeze(0).unsqueeze(0)
+
+
+def gaussian_filter(input, win):
+    r""" Blur input with 1-D kernel
+    Args:
+        input (torch.Tensor): a batch of tensors to be blured
+        window (torch.Tensor): 1-D gauss kernel
+
+    Returns:
+        torch.Tensor: blured tensors
+    """
+    N, C, H, W = input.shape
+    out = F.conv2d(input, win, stride=1, padding=0, groups=C)
+    out = F.conv2d(out, win.transpose(2, 3), stride=1, padding=0, groups=C)
+    return out
+
+
+def _ssim(X, Y, win, data_range=255, size_average=True, full=False):
+    r""" Calculate ssim index for X and Y
+    Args:
+        X (torch.Tensor): images
+        Y (torch.Tensor): images
+        win (torch.Tensor): 1-D gauss kernel
+        data_range (float or int, optional): value range of input images. (usually 1.0 or 255)
+        size_average (bool, optional): if size_average=True, ssim of all images will be averaged as a scalar
+        full (bool, optional): return sc or not
+
+    Returns:
+        torch.Tensor: ssim results
+    """
+
+    K1 = 0.01
+    K2 = 0.03
+    batch, channel, height, width = X.shape
+    compensation = 1.0
+
+    C1 = (K1 * data_range)**2
+    C2 = (K2 * data_range)**2
+
+    win = win.to(X.device, dtype=X.dtype)
+    mu1 = gaussian_filter(X, win)
+
+    mu2 = gaussian_filter(Y, win)
+
+    mu1_sq = mu1.pow(2)
+    mu2_sq = mu2.pow(2)
+    mu1_mu2 = mu1 * mu2
+
+    sigma1_sq = compensation * ( gaussian_filter(X * X, win) - mu1_sq )
+    sigma2_sq = compensation * ( gaussian_filter(Y * Y, win) - mu2_sq )
+    sigma12   = compensation * ( gaussian_filter(X * Y, win) - mu1_mu2 )
+
+    cs_map = (2 * sigma12 + C2) / (sigma1_sq + sigma2_sq + C2)
+    ssim_map = ((2 * mu1_mu2 + C1) / (mu1_sq + mu2_sq + C1)) * cs_map
+
+    if size_average:
+        ssim_val = ssim_map.mean()
+        cs = cs_map.mean()
+    else:
+        ssim_val = ssim_map.mean(-1).mean(-1).mean(-1)  # reduce along CHW
+        cs = cs_map.mean(-1).mean(-1).mean(-1)
+
+    if full:
+        return ssim_val, cs
+    else:
+        return ssim_val
+
+
+def ssim(X, Y, win_size=11, win_sigma=1.5, win=None, data_range=255, size_average=True, full=False):
+    r""" interface of ssim
+    Args:
+        X (torch.Tensor): a batch of images, (N,C,H,W)
+        Y (torch.Tensor): a batch of images, (N,C,H,W)
+        win_size: (int, optional): the size of gauss kernel
+        win_sigma: (float, optional): sigma of normal distribution
+        win (torch.Tensor, optional): 1-D gauss kernel. if None, a new kernel will be created according to win_size and win_sigma
+        data_range (float or int, optional): value range of input images. (usually 1.0 or 255)
+        size_average (bool, optional): if size_average=True, ssim of all images will be averaged as a scalar
+        full (bool, optional): return sc or not
+
+    Returns:
+        torch.Tensor: ssim results
+    """
+
+    if len(X.shape) != 4:
+        raise ValueError('Input images must 4-d tensor.')
+
+    if not X.type() == Y.type():
+        raise ValueError('Input images must have the same dtype.')
+
+    if not X.shape == Y.shape:
+        raise ValueError('Input images must have the same dimensions.')
+
+    if not (win_size % 2 == 1):
+        raise ValueError('Window size must be odd.')
+
+    win_sigma = win_sigma
+    if win is None:
+        win = _fspecial_gauss_1d(win_size, win_sigma)
+        win = win.repeat(X.shape[1], 1, 1, 1)
+    else:
+        win_size = win.shape[-1]
+
+    ssim_val, cs = _ssim(X, Y,
+                         win=win,
+                         data_range=data_range,
+                         size_average=False,
+                         full=True)
+    if size_average:
+        ssim_val = ssim_val.mean()
+        cs = cs.mean()
+
+    if full:
+        return ssim_val, cs
+    else:
+        return ssim_val
+
+
+def ms_ssim(X, Y, win_size=5, win_sigma=1.5, win=None, data_range=255, size_average=True, full=False, weights=None):
+    r""" interface of ms-ssim
+    Args:
+        X (torch.Tensor): a batch of images, (N,C,H,W)
+        Y (torch.Tensor): a batch of images, (N,C,H,W)
+        win_size: (int, optional): the size of gauss kernel
+        win_sigma: (float, optional): sigma of normal distribution
+        win (torch.Tensor, optional): 1-D gauss kernel. if None, a new kernel will be created according to win_size and win_sigma
+        data_range (float or int, optional): value range of input images. (usually 1.0 or 255)
+        size_average (bool, optional): if size_average=True, ssim of all images will be averaged as a scalar
+        full (bool, optional): return sc or not
+        weights (list, optional): weights for different levels
+
+    Returns:
+        torch.Tensor: ms-ssim results
+    """
+    if len(X.shape) != 4:
+        raise ValueError('Input images must 4-d tensor.')
+
+    if not X.type() == Y.type():
+        raise ValueError('Input images must have the same dtype.')
+
+    if not X.shape == Y.shape:
+        raise ValueError('Input images must have the same dimensions.')
+
+    if not (win_size % 2 == 1):
+        raise ValueError('Window size must be odd.')
+
+    if weights is None:
+        weights = torch.FloatTensor(
+            [0.0448, 0.2856, 0.3001, 0.2363, 0.1333]).to(X.device, dtype=X.dtype)
+
+    win_sigma = win_sigma
+    if win is None:
+        win = _fspecial_gauss_1d(win_size, win_sigma)
+        win = win.repeat(X.shape[1], 1, 1, 1)
+    else:
+        win_size = win.shape[-1]
+
+    levels = weights.shape[0]
+    mcs = []
+    for _ in range(levels):
+        #print('ok')
+        ssim_val, cs = _ssim(X, Y,
+                             win=win,
+                             data_range=data_range,
+                             size_average=False,
+                             full=True)
+        mcs.append(cs)
+
+        padding = (X.shape[2] % 2, X.shape[3] % 2)
+        X = F.avg_pool2d(X, kernel_size=2, padding=padding)
+        Y = F.avg_pool2d(Y, kernel_size=2, padding=padding)
+
+    mcs = torch.stack(mcs, dim=0)  # mcs, (level, batch)
+    # weights, (level)
+    msssim_val = torch.prod((mcs[:-1] ** weights[:-1].unsqueeze(1))
+                            * (ssim_val ** weights[-1]), dim=0)  # (batch, )
+
+    if size_average:
+        msssim_val = msssim_val.mean()
+    return msssim_val
+
+def ms_ssim_L1(X, Y):
+    """loss function of ms_ssim and l1 norm"""
+    return 0.84*(1-ms_ssim(X,Y)) + 0.16*torch.mean(torch.cuda.FloatTensor(X.size()).normal_(mean =0,std =1.5)*torch.abs(X-Y))
+
+def ssim_l2(X,Y,a=0.6,b=0.4):
+    """loss function of ms_ssim and l2 norm"""
+    return a*(1-ssim(X,Y)) + b*(torch.mean(torch.pow((X - Y), 2)))
+
+class fixed_loss(nn.Module):
+    def __init__(self):
+        super().__init__()
+        
+    def forward(self, out_image, gt_image, est_noise, gt_noise, if_asym):
+        h_x = est_noise.size()[2]
+        w_x = est_noise.size()[3]
+        count_h = self._tensor_size(est_noise[:, :, 1:, :])
+        count_w = self._tensor_size(est_noise[:, :, : ,1:])
+        h_tv = torch.pow((est_noise[:, :, 1:, :] - est_noise[:, :, :h_x-1, :]), 2).sum()
+        w_tv = torch.pow((est_noise[:, :, :, 1:] - est_noise[:, :, :, :w_x-1]), 2).sum()
+        tvloss = h_tv / count_h + w_tv / count_w
+        ## loss function
+        loss = ssim_l2(out_image,gt_image) + \
+                if_asym * 0.5 * torch.mean(torch.mul(torch.abs(0.3 - F.relu(gt_noise - est_noise)), torch.pow(est_noise - gt_noise, 2))) + \
+                0.05 * tvloss             
+        return loss
+
+    def _tensor_size(self,t):
+        return t.size()[1]*t.size()[2]*t.size()[3]
+
+##################################loss##################################
